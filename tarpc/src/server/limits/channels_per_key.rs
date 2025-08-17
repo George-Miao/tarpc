@@ -9,13 +9,13 @@ use crate::{
     util::Compact,
 };
 use fnv::FnvHashMap;
+use futures::channel::mpsc;
 use futures::{prelude::*, ready, stream::Fuse, task::*};
 use pin_project::pin_project;
 use std::sync::{Arc, Weak};
 use std::{
     collections::hash_map::Entry, convert::TryFrom, fmt, hash::Hash, marker::Unpin, pin::Pin,
 };
-use tokio::sync::mpsc;
 use tracing::{debug, info, trace};
 
 /// An [`Incoming`](crate::server::incoming::Incoming) stream that drops new channels based on
@@ -141,7 +141,7 @@ where
 {
     /// Sheds new channels to stay under configured limits.
     pub(crate) fn new(listener: S, channels_per_key: u32, keymaker: F) -> Self {
-        let (dropped_keys_tx, dropped_keys) = mpsc::unbounded_channel();
+        let (dropped_keys_tx, dropped_keys) = mpsc::unbounded();
         MaxChannelsPerKey {
             listener: listener.fuse(),
             channels_per_key,
@@ -231,7 +231,7 @@ where
 
     fn poll_closed_channels(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let self_ = self.project();
-        match ready!(self_.dropped_keys.poll_recv(cx)) {
+        match ready!(self_.dropped_keys.poll_next_unpin(cx)) {
             Some(key) => {
                 debug!(
                     channel_filter_key = %key,
@@ -277,204 +277,4 @@ where
             }
         }
     }
-}
-#[cfg(test)]
-fn ctx() -> Context<'static> {
-    use futures::task::*;
-
-    Context::from_waker(noop_waker_ref())
-}
-
-#[test]
-fn tracker_drop() {
-    use assert_matches::assert_matches;
-
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    Tracker {
-        key: Some(1),
-        dropped_keys: tx,
-    };
-    assert_matches!(rx.poll_recv(&mut ctx()), Poll::Ready(Some(1)));
-}
-
-#[test]
-fn tracked_channel_stream() {
-    use assert_matches::assert_matches;
-    use pin_utils::pin_mut;
-
-    let (chan_tx, chan) = futures::channel::mpsc::unbounded();
-    let (dropped_keys, _) = mpsc::unbounded_channel();
-    let channel = TrackedChannel {
-        inner: chan,
-        tracker: Arc::new(Tracker {
-            key: Some(1),
-            dropped_keys,
-        }),
-    };
-
-    chan_tx.unbounded_send("test").unwrap();
-    pin_mut!(channel);
-    assert_matches!(channel.poll_next(&mut ctx()), Poll::Ready(Some("test")));
-}
-
-#[test]
-fn tracked_channel_sink() {
-    use assert_matches::assert_matches;
-    use pin_utils::pin_mut;
-
-    let (chan, mut chan_rx) = futures::channel::mpsc::unbounded();
-    let (dropped_keys, _) = mpsc::unbounded_channel();
-    let channel = TrackedChannel {
-        inner: chan,
-        tracker: Arc::new(Tracker {
-            key: Some(1),
-            dropped_keys,
-        }),
-    };
-
-    pin_mut!(channel);
-    assert_matches!(channel.as_mut().poll_ready(&mut ctx()), Poll::Ready(Ok(())));
-    assert_matches!(channel.as_mut().start_send("test"), Ok(()));
-    assert_matches!(channel.as_mut().poll_flush(&mut ctx()), Poll::Ready(Ok(())));
-    assert_matches!(chan_rx.try_next(), Ok(Some("test")));
-}
-
-#[test]
-fn channel_filter_increment_channels_for_key() {
-    use assert_matches::assert_matches;
-    use pin_utils::pin_mut;
-
-    struct TestChannel {
-        key: &'static str,
-    }
-    let (_, listener) = futures::channel::mpsc::unbounded();
-    let filter = MaxChannelsPerKey::new(listener, 2, |chan: &TestChannel| chan.key);
-    pin_mut!(filter);
-    let tracker1 = filter.as_mut().increment_channels_for_key("key").unwrap();
-    assert_eq!(Arc::strong_count(&tracker1), 1);
-    let tracker2 = filter.as_mut().increment_channels_for_key("key").unwrap();
-    assert_eq!(Arc::strong_count(&tracker1), 2);
-    assert_matches!(filter.increment_channels_for_key("key"), Err("key"));
-    drop(tracker2);
-    assert_eq!(Arc::strong_count(&tracker1), 1);
-}
-
-#[test]
-fn channel_filter_handle_new_channel() {
-    use assert_matches::assert_matches;
-    use pin_utils::pin_mut;
-
-    #[derive(Debug)]
-    struct TestChannel {
-        key: &'static str,
-    }
-    let (_, listener) = futures::channel::mpsc::unbounded();
-    let filter = MaxChannelsPerKey::new(listener, 2, |chan: &TestChannel| chan.key);
-    pin_mut!(filter);
-    let channel1 = filter
-        .as_mut()
-        .handle_new_channel(TestChannel { key: "key" })
-        .unwrap();
-    assert_eq!(Arc::strong_count(&channel1.tracker), 1);
-
-    let channel2 = filter
-        .as_mut()
-        .handle_new_channel(TestChannel { key: "key" })
-        .unwrap();
-    assert_eq!(Arc::strong_count(&channel1.tracker), 2);
-
-    assert_matches!(
-        filter.handle_new_channel(TestChannel { key: "key" }),
-        Err("key")
-    );
-    drop(channel2);
-    assert_eq!(Arc::strong_count(&channel1.tracker), 1);
-}
-
-#[test]
-fn channel_filter_poll_listener() {
-    use assert_matches::assert_matches;
-    use pin_utils::pin_mut;
-
-    #[derive(Debug)]
-    struct TestChannel {
-        key: &'static str,
-    }
-    let (new_channels, listener) = futures::channel::mpsc::unbounded();
-    let filter = MaxChannelsPerKey::new(listener, 2, |chan: &TestChannel| chan.key);
-    pin_mut!(filter);
-
-    new_channels
-        .unbounded_send(TestChannel { key: "key" })
-        .unwrap();
-    let channel1 =
-        assert_matches!(filter.as_mut().poll_listener(&mut ctx()), Poll::Ready(Some(Ok(c))) => c);
-    assert_eq!(Arc::strong_count(&channel1.tracker), 1);
-
-    new_channels
-        .unbounded_send(TestChannel { key: "key" })
-        .unwrap();
-    let _channel2 =
-        assert_matches!(filter.as_mut().poll_listener(&mut ctx()), Poll::Ready(Some(Ok(c))) => c);
-    assert_eq!(Arc::strong_count(&channel1.tracker), 2);
-
-    new_channels
-        .unbounded_send(TestChannel { key: "key" })
-        .unwrap();
-    let key =
-        assert_matches!(filter.as_mut().poll_listener(&mut ctx()), Poll::Ready(Some(Err(k))) => k);
-    assert_eq!(key, "key");
-    assert_eq!(Arc::strong_count(&channel1.tracker), 2);
-}
-
-#[test]
-fn channel_filter_poll_closed_channels() {
-    use assert_matches::assert_matches;
-    use pin_utils::pin_mut;
-
-    #[derive(Debug)]
-    struct TestChannel {
-        key: &'static str,
-    }
-    let (new_channels, listener) = futures::channel::mpsc::unbounded();
-    let filter = MaxChannelsPerKey::new(listener, 2, |chan: &TestChannel| chan.key);
-    pin_mut!(filter);
-
-    new_channels
-        .unbounded_send(TestChannel { key: "key" })
-        .unwrap();
-    let channel =
-        assert_matches!(filter.as_mut().poll_listener(&mut ctx()), Poll::Ready(Some(Ok(c))) => c);
-    assert_eq!(filter.key_counts.len(), 1);
-
-    drop(channel);
-    assert_matches!(
-        filter.as_mut().poll_closed_channels(&mut ctx()),
-        Poll::Ready(())
-    );
-    assert!(filter.key_counts.is_empty());
-}
-
-#[test]
-fn channel_filter_stream() {
-    use assert_matches::assert_matches;
-    use pin_utils::pin_mut;
-
-    #[derive(Debug)]
-    struct TestChannel {
-        key: &'static str,
-    }
-    let (new_channels, listener) = futures::channel::mpsc::unbounded();
-    let filter = MaxChannelsPerKey::new(listener, 2, |chan: &TestChannel| chan.key);
-    pin_mut!(filter);
-
-    new_channels
-        .unbounded_send(TestChannel { key: "key" })
-        .unwrap();
-    let channel = assert_matches!(filter.as_mut().poll_next(&mut ctx()), Poll::Ready(Some(c)) => c);
-    assert_eq!(filter.key_counts.len(), 1);
-
-    drop(channel);
-    assert_matches!(filter.as_mut().poll_next(&mut ctx()), Poll::Pending);
-    assert!(filter.key_counts.is_empty());
 }

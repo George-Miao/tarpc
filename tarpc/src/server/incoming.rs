@@ -39,35 +39,6 @@ where
     }
 }
 
-#[cfg(feature = "tokio1")]
-/// Spawns all channels-in-execution, delegating to the tokio runtime to manage their completion.
-/// Each channel is spawned, and each request from each channel is spawned.
-/// Note that this function is generic over any stream-of-streams-of-futures, but it is intended
-/// for spawning streams of channels.
-///
-/// # Example
-/// ```rust
-/// use tarpc::{
-///     context,
-///     client::{self, NewClient},
-///     server::{self, BaseChannel, Channel, incoming::{Incoming, spawn_incoming}, serve},
-///     transport,
-/// };
-/// use futures::prelude::*;
-///
-/// #[tokio::main]
-/// async fn main() {
-///     let (tx, rx) = transport::channel::unbounded();
-///     let NewClient { client, dispatch } = client::new(client::Config::default(), tx);
-///     tokio::spawn(dispatch);
-///
-///     let incoming = stream::once(async move {
-///         BaseChannel::new(server::Config::default(), rx)
-///     }).execute(serve(|_, i| async move { Ok(i + 1) }));
-///     tokio::spawn(spawn_incoming(incoming));
-///     assert_eq!(client.call(context::current(), 1).await.unwrap(), 2);
-/// }
-/// ```
 pub async fn spawn_incoming(
     incoming: impl Stream<
         Item = impl Stream<Item = impl Future<Output = ()> + Send + 'static> + Send + 'static,
@@ -76,10 +47,10 @@ pub async fn spawn_incoming(
     use futures::pin_mut;
     pin_mut!(incoming);
     while let Some(channel) = incoming.next().await {
-        tokio::spawn(async move {
+        n0_future::task::spawn(async move {
             pin_mut!(channel);
             while let Some(request) = channel.next().await {
-                tokio::spawn(request);
+                n0_future::task::spawn(request);
             }
         });
     }
